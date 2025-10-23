@@ -39,16 +39,23 @@ def get_db_connection():
         logger.error(f"Database bağlantı hatası: {e}")
         return None
 
-def is_user_authorized(telegram_user_id):
+def get_user_info(telegram_user_id):
+    """
+    Kullanıcı bilgilerini database'den çek (telefon dahil)
+    """
     conn = get_db_connection()
     if not conn:
-        logger.warning("Database bağlantısı yok, whitelist kontrolü yapılamadı!")
-        return False
+        return None
     
     try:
         with conn.cursor() as cursor:
             sql = """
-                SELECT tum.id, tum.user_id, u.full_name, u.is_active as user_active
+                SELECT 
+                    tum.id, 
+                    tum.user_id, 
+                    u.full_name, 
+                    u.phone,
+                    u.is_active as user_active
                 FROM telegram_user_mapping tum
                 LEFT JOIN users u ON tum.user_id = u.id
                 WHERE tum.telegram_user_id = %s 
@@ -56,24 +63,29 @@ def is_user_authorized(telegram_user_id):
                 LIMIT 1
             """
             cursor.execute(sql, (telegram_user_id,))
-            result = cursor.fetchone()
-            
-            if result:
-                if result['user_active'] == 1 or result['user_active'] is None:
-                    logger.info(f"✅ Yetkili kullanıcı: {telegram_user_id} ({result['full_name']})")
-                    return True
-                else:
-                    logger.warning(f"❌ Kullanıcı pasif: {telegram_user_id}")
-                    return False
-            else:
-                logger.warning(f"❌ Yetkisiz erişim denemesi: {telegram_user_id}")
-                return False
-                
+            return cursor.fetchone()
     except Exception as e:
-        logger.error(f"Yetki kontrolü hatası: {e}")
-        return False
+        logger.error(f"Kullanıcı bilgisi alma hatası: {e}")
+        return None
     finally:
         conn.close()
+
+def is_user_authorized(telegram_user_id):
+    """
+    telegram_user_mapping tablosunda kayıtlı ve aktif mi?
+    """
+    user_info = get_user_info(telegram_user_id)
+    
+    if user_info:
+        if user_info['user_active'] == 1 or user_info['user_active'] is None:
+            logger.info(f"✅ Yetkili kullanıcı: {telegram_user_id} ({user_info['full_name']})")
+            return True
+        else:
+            logger.warning(f"❌ Kullanıcı pasif: {telegram_user_id}")
+            return False
+    else:
+        logger.warning(f"❌ Yetkisiz erişim denemesi: {telegram_user_id}")
+        return False
 
 def get_sheet():
     try:
@@ -113,14 +125,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
-    authorized = is_user_authorized(user.id)
-    status = "✅ Kayıtlı" if authorized else "❌ Kayıtsız"
+    user_info = get_user_info(user.id)
+    
+    if user_info:
+        status = "✅ Kayıtlı"
+        phone = user_info['phone'] if user_info['phone'] else 'Kayıtsız'
+    else:
+        status = "❌ Kayıtsız"
+        phone = '-'
     
     await update.message.reply_text(
         f"📱 Telegram Bilgileriniz:\n\n"
         f"🆔 ID: {user.id}\n"
         f"👤 Ad: {user.first_name} {user.last_name or ''}\n"
-        f"🔤 Kullanıcı Adı: @{user.username or 'Yok'}\n\n"
+        f"🔤 Kullanıcı Adı: @{user.username or 'Yok'}\n"
+        f"📞 Telefon: {phone}\n\n"
         f"📊 Durum: {status}"
     )
 
@@ -141,10 +160,14 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         location = update.message.location
         timestamp = update.message.date
         
+        # Kullanıcı bilgilerini database'den çek
+        user_info = get_user_info(user.id)
+        
         latitude = location.latitude
         longitude = location.longitude
-        user_name = f"{user.first_name} {user.last_name if user.last_name else ''}".strip()
+        user_name = user_info['full_name'] if user_info else f"{user.first_name} {user.last_name or ''}".strip()
         user_id = user.id
+        phone = user_info['phone'] if user_info and user_info['phone'] else '-'
         maps_link = f"https://www.google.com/maps?q={latitude},{longitude}"
         tr_time = timestamp.strftime('%d.%m.%Y %H:%M:%S')
         
@@ -154,6 +177,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tr_time,
                 user_name,
                 str(user_id),
+                phone,
                 str(latitude),
                 str(longitude),
                 maps_link,
@@ -161,7 +185,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ''
             ])
             
-            logger.info(f"✅ Konum kaydedildi: {user_name} (ID: {user_id}) - {maps_link}")
+            logger.info(f"✅ Konum kaydedildi: {user_name} (ID: {user_id}, Tel: {phone}) - {maps_link}")
             
             await update.message.reply_text(
                 f"✅ Konum kaydedildi!\n\n"
