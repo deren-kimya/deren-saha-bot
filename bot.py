@@ -41,7 +41,7 @@ def get_db_connection():
 
 def get_user_info(telegram_user_id):
     """
-    Kullanıcı bilgilerini database'den çek (telefon dahil)
+    Kullanıcı bilgilerini database'den çek (telefon ve rol dahil)
     """
     conn = get_db_connection()
     if not conn:
@@ -55,6 +55,7 @@ def get_user_info(telegram_user_id):
                     tum.user_id, 
                     u.full_name, 
                     u.phone,
+                    u.user_type,
                     u.is_active as user_active
                 FROM telegram_user_mapping tum
                 LEFT JOIN users u ON tum.user_id = u.id
@@ -72,20 +73,28 @@ def get_user_info(telegram_user_id):
 
 def is_user_authorized(telegram_user_id):
     """
-    telegram_user_mapping tablosunda kayıtlı ve aktif mi?
+    telegram_user_mapping tablosunda kayıtlı, aktif ve müşteri OLMAYAN kullanıcılar yetkili
+    Müşteriler (customer) konum gönderemez!
     """
     user_info = get_user_info(telegram_user_id)
     
-    if user_info:
-        if user_info['user_active'] == 1 or user_info['user_active'] is None:
-            logger.info(f"✅ Yetkili kullanıcı: {telegram_user_id} ({user_info['full_name']})")
-            return True
-        else:
-            logger.warning(f"❌ Kullanıcı pasif: {telegram_user_id}")
-            return False
-    else:
+    if not user_info:
         logger.warning(f"❌ Yetkisiz erişim denemesi: {telegram_user_id}")
         return False
+    
+    # Kullanıcı pasif mi?
+    if user_info['user_active'] != 1 and user_info['user_active'] is not None:
+        logger.warning(f"❌ Kullanıcı pasif: {telegram_user_id}")
+        return False
+    
+    # MÜŞTERİ KONTROLÜ - YENİ EKLENEN KISIM
+    if user_info['user_type'] == 'customer':
+        logger.warning(f"❌ Müşteri erişim denemesi: {telegram_user_id} ({user_info['full_name']}) - Müşteriler konum gönderemez!")
+        return False
+    
+    # Tüm kontroller geçti
+    logger.info(f"✅ Yetkili kullanıcı: {telegram_user_id} ({user_info['full_name']}) - Rol: {user_info['user_type']}")
+    return True
 
 def get_sheet():
     try:
@@ -106,9 +115,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_authorized(user.id):
         await update.message.reply_text(
             "🚫 Yetkisiz Erişim\n\n"
-            "Bu bot sadece Deren Kimya satış temsilcileri için aktiftir.\n\n"
+            "Bu bot sadece Deren Kimya çalışanları için aktiftir.\n"
+            "Müşteriler konum gönderemez.\n\n"
             f"📱 Telegram ID'niz: {user.id}\n\n"
-            "Eğer satış temsilcisiyseniz, bu ID'yi yöneticinize gönderin."
+            "Eğer çalışan iseniz, bu ID'yi yöneticinize gönderin."
         )
         logger.warning(f"Yetkisiz /start denemesi: {user.id} ({user.first_name})")
         return
@@ -130,16 +140,25 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_info:
         status = "✅ Kayıtlı"
         phone = user_info['phone'] if user_info['phone'] else 'Kayıtsız'
+        role_labels = {
+            'super_admin': 'Sistem Yöneticisi',
+            'moderator_admin': 'İdari Yönetici',
+            'sales_rep': 'Satış Temsilcisi',
+            'customer': 'Müşteri'
+        }
+        role = role_labels.get(user_info['user_type'], user_info['user_type'] or '-')
     else:
         status = "❌ Kayıtsız"
         phone = '-'
+        role = '-'
     
     await update.message.reply_text(
         f"📱 Telegram Bilgileriniz:\n\n"
         f"🆔 ID: {user.id}\n"
         f"👤 Ad: {user.first_name} {user.last_name or ''}\n"
         f"🔤 Kullanıcı Adı: @{user.username or 'Yok'}\n"
-        f"📞 Telefon: {phone}\n\n"
+        f"📞 Telefon: {phone}\n"
+        f"👔 Rol: {role}\n\n"
         f"📊 Durum: {status}"
     )
 
@@ -150,7 +169,8 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🚫 Yetkiniz Yok\n\n"
             "Konum gönderme yetkiniz bulunmamaktadır.\n"
-            "Satış temsilcisi iseniz yöneticinizle iletişime geçin.\n\n"
+            "Bu özellik sadece Deren Kimya çalışanları içindir.\n"
+            "Müşteriler konum gönderemez.\n\n"
             f"Telegram ID: {user.id}"
         )
         logger.warning(f"❌ Yetkisiz konum gönderme denemesi: {user.id} ({user.first_name})")
@@ -185,7 +205,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ''
             ])
             
-            logger.info(f"✅ Konum kaydedildi: {user_name} (ID: {user_id}, Tel: {phone}) - {maps_link}")
+            logger.info(f"✅ Konum kaydedildi: {user_name} (ID: {user_id}, Tel: {phone}, Rol: {user_info['user_type']}) - {maps_link}")
             
             await update.message.reply_text(
                 f"✅ Konum kaydedildi!\n\n"
@@ -204,7 +224,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not is_user_authorized(user.id):
         await update.message.reply_text(
-            "🚫 Bu bot sadece Deren Kimya satış temsilcileri içindir.\n\n"
+            "🚫 Bu bot sadece Deren Kimya çalışanları içindir.\n"
+            "Müşteriler bu botu kullanamaz.\n\n"
             f"Telegram ID: {user.id}"
         )
         return
@@ -223,7 +244,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     logger.info("🤖 Güvenli Bot başlatılıyor...")
-    logger.info("🔒 Whitelist sistemi aktif")
+    logger.info("🔒 Whitelist sistemi aktif - Müşteriler hariç")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
