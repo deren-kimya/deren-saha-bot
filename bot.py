@@ -8,6 +8,42 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import pymysql
 
+# bot.py - En başa eklenecek IP öğrenme kodu
+
+import socket
+import requests
+import logging
+
+# Logger ayarları
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Railway IP'sini öğren ve logla
+def log_railway_ip():
+    """Railway'in IP adreslerini öğren ve logla"""
+    try:
+        # Local IP
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        logger.info(f"🌐 Railway Local IP: {local_ip}")
+        
+        # Public IP (Railway'in dış dünyaya çıktığı IP)
+        response = requests.get('https://api.ipify.org?format=json', timeout=5)
+        public_ip = response.json()['ip']
+        logger.info(f"🌍 Railway Public IP: {public_ip}")
+        logger.info(f"⭐ BU IP'YI PLESK'TE WHITELIST'E EKLEYİN: {public_ip}")
+        
+        return public_ip
+    except Exception as e:
+        logger.error(f"❌ IP öğrenilemedi: {e}")
+        return None
+
+# Bot başlatıldığında IP'yi logla
+railway_ip = log_railway_ip()
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -249,3 +285,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
