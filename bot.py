@@ -3,8 +3,8 @@ import logging
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import mysql.connector
-from mysql.connector import Error
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ===========================================
 # LOGGER AYARLARI
@@ -16,112 +16,111 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 logger.info("=" * 60)
-logger.info("🤖 SAHA ZİYARET BOT BAŞLATILIYOR (MySQL Direkt)...")
+logger.info("🤖 SAHA ZİYARET BOT BAŞLATILIYOR...")
 logger.info("=" * 60)
 
 # ===========================================
 # ENVIRONMENT VARIABLES
 # ===========================================
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-DB_HOST = os.getenv('DB_HOST')
-DB_NAME = os.getenv('DB_NAME')
-DB_USER = os.getenv('DB_USER')
-DB_PASS = os.getenv('DB_PASS')
-DB_PORT = os.getenv('DB_PORT', '3306')
+GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Deren Kimya Saha Ziyaret Optimizasyonu')
+ADMIN_TELEGRAM_IDS = os.getenv('ADMIN_TELEGRAM_IDS', '410711923').split(',')
 
 # ===========================================
-# MYSQL BAĞLANTISI
+# GOOGLE SHEETS BAĞLANTISI
 # ===========================================
-def get_db_connection():
-    """MySQL bağlantısı oluştur"""
+def get_google_sheet():
+    """Google Sheets'e bağlan"""
     try:
-        connection = mysql.connector.connect(
-            host=DB_HOST,
-            port=int(DB_PORT),
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASS
-        )
+        import json
+        creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
         
-        if connection.is_connected():
-            logger.info("✅ MySQL bağlantısı başarılı")
-            return connection
+        if not creds_json:
+            logger.error("❌ GOOGLE_CREDENTIALS_JSON bulunamadı!")
+            return None
         
-    except Error as e:
-        logger.error(f"❌ MySQL bağlantı hatası: {e}")
+        creds_dict = json.loads(creds_json)
+        
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        client = gspread.authorize(creds)
+        sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+        
+        logger.info("✅ Google Sheets bağlantısı başarılı")
+        return sheet
+        
+    except Exception as e:
+        logger.error(f"❌ Google Sheets bağlantı hatası: {e}")
         return None
 
 # ===========================================
 # KONUM KAYDETME
 # ===========================================
-def save_location_to_db(telegram_id: int, user_name: str, latitude: float, longitude: float):
-    """Konumu MySQL'e kaydet"""
+def save_location_to_sheets(telegram_id: int, user_name: str, latitude: float, longitude: float, phone: str = None):
+    """Konumu Google Sheets'e kaydet"""
     try:
-        connection = get_db_connection()
-        if not connection:
-            logger.error("❌ Database bağlantısı yok")
+        sheet = get_google_sheet()
+        if not sheet:
+            logger.error("❌ Sheet bağlantısı yok")
             return False
         
-        cursor = connection.cursor()
-        
-        # 🔒 WHİTELİST KONTROLÜ
-        check_query = """
-            SELECT tum.user_id, u.user_type 
-            FROM telegram_user_mapping tum
-            JOIN users u ON tum.user_id = u.id
-            WHERE tum.telegram_user_id = %s 
-            AND tum.is_active = 1
-            LIMIT 1
-        """
-        
-        cursor.execute(check_query, (telegram_id,))
-        user_mapping = cursor.fetchone()
-        
-        # ❌ Kullanıcı whitelist'te değil
-        if not user_mapping:
-            logger.warning(f"⚠️  Yetkisiz kullanıcı: {user_name} (ID: {telegram_id})")
-            cursor.close()
-            connection.close()
-            return False
-        
-        user_id, user_type = user_mapping
-        
-        # ❌ Müşteri ise kaydetme
-        if user_type == 'customer':
-            logger.warning(f"⚠️  Müşteri atlandı: {user_name} (ID: {telegram_id})")
-            cursor.close()
-            connection.close()
-            return False
-        
-        # ✅ Konumu kaydet
-        visit_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         google_maps_url = f"https://www.google.com/maps?q={latitude},{longitude}"
         
-        insert_query = """
-            INSERT INTO field_visits 
-            (user_id, telegram_user_id, latitude, longitude, visit_date, maps_link, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-        """
+        row = [
+            timestamp,
+            user_name,
+            str(telegram_id),
+            phone or "",
+            str(latitude),
+            str(longitude),
+            google_maps_url,
+            ""
+        ]
         
-        cursor.execute(insert_query, (
-            user_id,
-            telegram_id,
-            latitude,
-            longitude,
-            visit_date,
-            google_maps_url
-        ))
-        
-        connection.commit()
-        cursor.close()
-        connection.close()
-        
+        sheet.append_row(row)
         logger.info(f"✅ Konum kaydedildi: {user_name} | {latitude},{longitude}")
         return True
         
-    except Error as e:
+    except Exception as e:
         logger.error(f"❌ Konum kaydetme hatası: {e}")
         return False
+
+# ===========================================
+# SHEETS TEMİZLEME (ADMIN)
+# ===========================================
+def clear_sheets_data():
+    """Google Sheets'teki tüm veriyi temizle (başlık hariç)"""
+    try:
+        sheet = get_google_sheet()
+        if not sheet:
+            logger.error("❌ Sheet bağlantısı yok")
+            return False
+        
+        all_rows = sheet.get_all_values()
+        if len(all_rows) > 1:
+            sheet.delete_rows(2, len(all_rows))
+            logger.info(f"✅ {len(all_rows) - 1} satır silindi")
+            return True
+        else:
+            logger.info("ℹ️ Silinecek veri yok")
+            return True
+        
+    except Exception as e:
+        logger.error(f"❌ Sheets temizleme hatası: {e}")
+        return False
+
+# ===========================================
+# ADMIN KONTROL
+# ===========================================
+def is_admin(telegram_id: int) -> bool:
+    """Kullanıcı admin mi kontrol et"""
+    return str(telegram_id) in ADMIN_TELEGRAM_IDS
 
 # ===========================================
 # TELEGRAM BOT KOMUTLARI
@@ -133,28 +132,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"👤 /start komutu: {user_name} (ID: {telegram_id})")
     
-    await update.message.reply_text(
+    message = (
         f"✅ Merhaba {user_name}!\n\n"
         "Saha ziyareti sırasında konumunuzu paylaşabilirsiniz.\n\n"
         "📍 Telegram'ın konum paylaşma özelliğini kullanarak "
         "anlık konumunuzu gönderin.\n\n"
-        "🔒 Sadece yetkili kullanıcıların konumları kaydedilir."
+        "Konumunuz kaydedilecek ve yöneticileriniz tarafından görülebilecek."
     )
+    
+    if is_admin(telegram_id):
+        message += "\n\n🔧 Admin Komutları:\n"
+        message += "/clear - Sheets'teki tüm veriyi temizle\n"
+        message += "/count - Kayıtlı konum sayısı"
+    
+    await update.message.reply_text(message)
 
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Konum mesajlarını işle"""
     telegram_id = update.effective_user.id
     user_name = update.effective_user.full_name
+    phone = update.effective_user.username
     
     logger.info(f"📍 Konum alındı: {user_name} (ID: {telegram_id})")
     
-    # Konum bilgilerini al
     location = update.message.location
     latitude = location.latitude
     longitude = location.longitude
     
-    # MySQL'e kaydet (whitelist kontrolü fonksiyon içinde)
-    success = save_location_to_db(telegram_id, user_name, latitude, longitude)
+    success = save_location_to_sheets(telegram_id, user_name, latitude, longitude, phone)
     
     if success:
         google_maps_url = f"https://www.google.com/maps?q={latitude},{longitude}"
@@ -167,10 +172,84 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            "⚠️ Konum kaydedilemedi.\n\n"
-            "Lütfen sistem yöneticinizle iletişime geçin.\n"
-            "Yalnızca yetkili kullanıcılar konum gönderebilir."
+            "❌ Konum kaydedilemedi.\n\n"
+            "Lütfen tekrar deneyin veya sistem yöneticisiyle iletişime geçin."
         )
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sheets'i temizle (sadece admin)"""
+    telegram_id = update.effective_user.id
+    user_name = update.effective_user.full_name
+    
+    logger.info(f"🗑️ /clear komutu: {user_name} (ID: {telegram_id})")
+    
+    if not is_admin(telegram_id):
+        await update.message.reply_text("❌ Bu komutu kullanma yetkiniz yok!")
+        logger.warning(f"⚠️ Yetkisiz /clear denemesi: {user_name} (ID: {telegram_id})")
+        return
+    
+    await update.message.reply_text(
+        "⚠️ DİKKAT!\n\n"
+        "Google Sheets'teki TÜM VERİLER silinecek!\n\n"
+        "Devam etmek için /clearconfirm yazın."
+    )
+
+async def clear_confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sheets temizleme onayı (sadece admin)"""
+    telegram_id = update.effective_user.id
+    user_name = update.effective_user.full_name
+    
+    logger.info(f"🗑️ /clearconfirm komutu: {user_name} (ID: {telegram_id})")
+    
+    if not is_admin(telegram_id):
+        await update.message.reply_text("❌ Bu komutu kullanma yetkiniz yok!")
+        return
+    
+    await update.message.reply_text("⏳ Veriler temizleniyor...")
+    
+    success = clear_sheets_data()
+    
+    if success:
+        await update.message.reply_text(
+            "✅ Google Sheets başarıyla temizlendi!\n\n"
+            "Tüm konum kayıtları silindi."
+        )
+        logger.info(f"✅ Sheets temizlendi (Admin: {user_name})")
+    else:
+        await update.message.reply_text(
+            "❌ Temizleme sırasında hata oluştu!\n\n"
+            "Lütfen sistem yöneticisiyle iletişime geçin."
+        )
+
+async def count_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kayıtlı konum sayısını göster (sadece admin)"""
+    telegram_id = update.effective_user.id
+    user_name = update.effective_user.full_name
+    
+    logger.info(f"📊 /count komutu: {user_name} (ID: {telegram_id})")
+    
+    if not is_admin(telegram_id):
+        await update.message.reply_text("❌ Bu komutu kullanma yetkiniz yok!")
+        return
+    
+    try:
+        sheet = get_google_sheet()
+        if not sheet:
+            await update.message.reply_text("❌ Sheet bağlantısı kurulamadı!")
+            return
+        
+        all_rows = sheet.get_all_values()
+        count = len(all_rows) - 1
+        
+        await update.message.reply_text(
+            f"📊 İstatistikler\n\n"
+            f"Toplam Kayıt: {count}\n"
+            f"Sheet: {GOOGLE_SHEET_NAME}"
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Count hatası: {e}")
+        await update.message.reply_text("❌ İstatistik alınırken hata oluştu!")
 
 # ===========================================
 # ANA FONKSİYON
@@ -178,18 +257,17 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Bot'u başlat"""
     logger.info("🚀 Bot başlatılıyor...")
-    logger.info("🔒 Güvenlik: Whitelist kontrolü AKTİF")
-    logger.info("💾 Veritabanı: MySQL Direkt Kayıt")
-    logger.info("📊 Google Sheets: KULLANILMIYOR")
+    logger.info("📝 Mod: Herkes konum gönderebilir")
+    logger.info(f"🔧 Admin Telegram IDs: {ADMIN_TELEGRAM_IDS}")
     
-    # Application oluştur
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Handler'ları ekle
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("clearconfirm", clear_confirm_command))
+    application.add_handler(CommandHandler("count", count_command))
     application.add_handler(MessageHandler(filters.LOCATION, handle_location))
     
-    # Bot'u çalıştır
     logger.info("✅ Bot çalışıyor ve konum bekliyor...")
     logger.info("=" * 60)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
